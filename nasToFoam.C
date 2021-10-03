@@ -68,7 +68,7 @@ void processCommentedLine(IFstream& is)
     string line;
     is.getLine(line);
     // Yep, this is not too safe...
-    label lastSpace = line.find_last_of(' ');
+    size_t lastSpace = line.find_last_of(' ');
     if (lastSpace < line.size())
     {
         commentBuffer = line.substr(lastSpace + 1);
@@ -364,7 +364,7 @@ int main(int argc, char *argv[])
     // Read the next entry into the buffer.
     getEntry(inFile);
 
-    Info << "Start reading file." << endl;
+    Info<< "Start reading file." << endl;
     while (inFile.good())
     {
         if (entryBuff == "GRID")
@@ -427,7 +427,7 @@ int main(int argc, char *argv[])
         }
         else if (entryBuff == "ENDDATA")
         {
-            Info << "Finished reading file." << endl;
+            Info<< "Finished reading file." << endl;
             break;
         }
         else
@@ -447,7 +447,7 @@ int main(int argc, char *argv[])
         patchFaces[pI].append(boundaryFaces[i]);
     }
 
-    Info << "Constructing the mesh." << endl;
+    Info<< "Constructing the mesh." << endl;
     polyMesh mesh
     (
         IOobject
@@ -469,7 +469,7 @@ int main(int argc, char *argv[])
     
     if (cellZoneIDs.size())
     {
-        Info << "Adding cell zones." << endl;
+        Info<< "Adding cell zones." << endl;
 
         List<cellZone*> cZones(cellZoneIDs.size());
         
@@ -494,6 +494,15 @@ int main(int argc, char *argv[])
 
         mesh.addZones(List<pointZone*>(), List<faceZone*>(), cZones);
     }
+
+    Info<< endl;
+    Info<< "Mesh information:" << endl
+        << "Number of points: " << mesh.nPoints() << endl
+        << "Number of faces: " << mesh.nFaces() << endl
+        << "Number of cells: " << mesh.nCells() << endl
+        << "Number of patches: " << patchNames.size() << ":" << endl;
+    forAll(patchNames, i) Info<< "\t" << patchNames[i] << endl;
+    Info<< endl;
 
     mesh.removeFiles();
     mesh.write();

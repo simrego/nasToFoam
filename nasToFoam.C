@@ -22,13 +22,14 @@ Description
 #include "polyMesh.H"
 #include "Time.H"
 #include "IFstream.H"
+#include "StringStream.H"
 
 using namespace Foam;
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 // Dat file format.
-enum struct FORMAT : label
+enum struct FORMAT : char
 {
     FREE = 0,
     SMALL = 8,
@@ -39,30 +40,47 @@ FORMAT format = FORMAT::SMALL;
 
 // Last extracted entry kw
 string entryBuff;
-// fwd get entry
+
+// Buffer for last comment with it's line number. (patch, cellZone names)
+word commentBuffer;
+label commentLine;
+
+// Get the next entry and store it in the buffer (fwd)
 string& getEntry(IFstream& is);
 
-
+// Ignore everything until we find the "BEGIN BULK" entry
 bool findBulk(IFstream& is)
 {
     string line;
     while (is.good())
     {
-        // Skip commented lines
-        if (is.peek() == '$') 
-        {
-            is.getLine(nullptr);
-            continue;
-        };
-
         is.getLine(line);
         if (line.starts_with("BEGIN BULK")) return true;
     }
     return false;
 }
 
-// Skip everything on this line, and next lines if we have a multiline.
-void skipLine(IFstream& is)
+// Process a commented line.
+// e.g. NX nastran write the property card name as comment before the entry.
+// So now just store the last word from the comment which is the name.
+void processCommentedLine(IFstream& is)
+{
+    string line;
+    is.getLine(line);
+    // Yep, this is not too safe...
+    label lastSpace = line.find_last_of(' ');
+    if (lastSpace < line.size())
+    {
+        commentBuffer = line.substr(lastSpace + 1);
+        commentLine = is.lineNumber();
+    }
+}
+
+// Skip everything on this line, and next lines if we have a multiline entry.
+// The only problem if we get the '\n' from the stream. In this case the
+// next line will be skipped which shouldn't be...
+// WARNING: Make sure the '\n' is kept in the stream.
+void finishEntry(IFstream& is)
 {
     string line;
     while (true)
@@ -73,38 +91,42 @@ void skipLine(IFstream& is)
         line.erase(std::remove(line.begin(), line.end(), 13),
                  line.end());
 
-        // It could be "if (!line.endsWith("+\n")) break;" but it is a little
-        // confusing...
-        if (line.ends_with('+')) continue;
-        else break;
+        // If the end of the line is '+', the next line is the same entry.
+        if (!line.ends_with('+')) break;
     }
 
 }
 
-string getColumn(IFstream& is, label size = label(format))
+// Extract the next column from the file.
+string getColumn(IFstream& is, char size = char(format))
 {
-    label i = 0;
-    char buff[63];  // More than enough, get size no chars
-
     if (size == 0) // Increase for free format to avoid overflow
     {
         size = 63;
     }
+ 
+    label i = 0;
+    char buff[63];  // More than enough, get size no chars
 
     while (i < size)
     {
         is.get(buff[i]);
         // Stop at new line, or ',' for free format.
-        if (buff[i] == '\n' || buff[i] == ',')
+        if (buff[i] == '\n')
         {
             i++;
+            break;
+        }
+        else if (buff[i] == ',') // only possible in free format
+        {
+            // DOnt increase i, so we will change it to '\0'
             break;
         }
         i++;
     }
     buff[i] = '\0';
 
-    // Continue on new line if end with + and next start with + or *
+    // Continue on new line if end with "+\n" and next start with + or *
     if (buff[0] == '+' && buff[i-1] == '\n' &&
         (is.peek() == '+' || is.peek() == '*'))
     {
@@ -119,12 +141,12 @@ string getColumn(IFstream& is, label size = label(format))
         return getColumn(is, size);
     }
 
-    // In free format remove ','
-    if (format == FORMAT::FREE)
+    // In free format '\n' is removed from the stream but we will need it
+    // to finish the entry. Put it back IF we have it.
+    if (format == FORMAT::FREE && buff[i-1] == '\n')
     {
-        // Quirky..
-        if (buff[i-1] == ',') buff[i-1] = '\0';
-        if (buff[i-1] == '\n') is.putback('\n');
+        buff[i-1] = '\0';
+        is.putback('\n');
     }
 
     string data = string(buff);
@@ -132,13 +154,17 @@ string getColumn(IFstream& is, label size = label(format))
     data.erase(std::remove(data.begin(), data.end(), ' '),
                  data.end());
 
+    // Remove stupid carriage return char...
+    data.erase(std::remove(data.begin(), data.end(), 13),
+             data.end());
+
     return data;
 }
 
 string& getEntry(IFstream& is)
 {
     // Skip comments
-    while (is.good() && is.peek() == '$') is.getLine(nullptr);
+    while (is.good() && is.peek() == '$') processCommentedLine(is);
 
     switch (format)
     {
@@ -174,16 +200,7 @@ scalar getScalar(IFstream& is)
     return readFloat(data);
 }
 
-point getPoint(IFstream& is)
-{
-    // returnt point(get, get, get) will reverse the components. BUG? Or what?
-    point pt;
-    pt[0] = getScalar(is);
-    pt[1] = getScalar(is);
-    pt[2] = getScalar(is);
-    return pt;
-}
-
+// Read points until we find some different entry.
 // GRID card format, where CP is ignored:
 // GRID   ID   CP   X  Y  Z  ...
 void readPoints(IFstream& is, DynamicList<point> &points)
@@ -199,24 +216,23 @@ void readPoints(IFstream& is, DynamicList<point> &points)
                 << exit(FatalError);
         }
 
-        // Ignore CP, we should skip the pointless conversion...
-        getLabel(is);
+        // Ignore CP column...
+        getColumn(is);
         // Get the 3 coordinate
-        points.append(getPoint(is));
+        point pt;
+        pt[0] = getScalar(is);
+        pt[1] = getScalar(is);
+        pt[2] = getScalar(is);
+        points.append(pt);
         // Ignore the other entries
-        skipLine(is); //is.getLine(nullptr);
+        finishEntry(is); //is.getLine(nullptr);
 
-        if (getEntry(is).starts_with("GRID"))
-        {
-            continue;
-        }
-        else
-        {
-            break;
-        }
+        // No more GRID entry.
+        if (!getEntry(is).starts_with("GRID")) break;
     }
 }
 
+// Read cells of a given type.
 template<cellModel::modelType TYPE>
 void readCell
 (
@@ -240,7 +256,7 @@ void readCell
         }
         cellVerts.append(cellShape(model, verts, true));
 
-        skipLine(is);
+        finishEntry(is);
         getEntry(is);
     }
 }
@@ -266,7 +282,7 @@ void readFaces
         }
         boundaryFaces.append(fVerts);
 
-        skipLine(is); // Get the end of the line
+        finishEntry(is); // Get the end of the line
         getEntry(is);
     }
 }
@@ -282,7 +298,7 @@ int main(int argc, char *argv[])
     argList::addOption(
         "format",
         "word",
-        "Input format. small(default), large, free"
+        "Input format. Options: small(default), large, free"
     );
 
     #include "setRootCase.H"
@@ -293,7 +309,7 @@ int main(int argc, char *argv[])
         word inpForm = args.getOrDefault<word>("format", "small");
         if (inpForm == "small") 
         {
-        // Do nothing. Initialised to small.
+            // Do nothing. Initialised to small.
         }
         else if (inpForm == "large")
         {
@@ -340,8 +356,10 @@ int main(int argc, char *argv[])
     DynamicList<label> facePropIDs;
     // Cell zoneIDs
     DynamicList<label> cellZoneIDs;
+    wordList cellZoneNames;
     // Patch IDs
     DynamicList<label> patchIDs;
+    wordList patchNames;
 
     // Read the next entry into the buffer.
     getEntry(inFile);
@@ -377,19 +395,37 @@ int main(int argc, char *argv[])
         }
         else if (entryBuff == "PSOLID")
         {
-            // add to cell zones
+            // Cell Zones
+            if (commentLine == inFile.lineNumber())
+            {
+                cellZoneNames.append(commentBuffer);
+            }
+            else
+            {
+                cellZoneNames.append(
+                    "cellZone" + std::to_string(cellZoneNames.size()));
+            }
             cellZoneIDs.append(getLabel(inFile));
-            skipLine(inFile);
+            finishEntry(inFile);
             getEntry(inFile);
         }
         else if (entryBuff == "PSHELL")
         {
-            // add to patches
+            // Patches
+            if (commentLine == inFile.lineNumber())
+            {
+                patchNames.append(commentBuffer);
+            }
+            else
+            {
+                patchNames.append(
+                    "patch" + std::to_string(patchNames.size()));
+            }
             patchIDs.append(getLabel(inFile));
-            skipLine(inFile);
+            finishEntry(inFile);
             getEntry(inFile);
         }
-        else if (entryBuff.starts_with("ENDDATA")) // EOF did some weird stuff.
+        else if (entryBuff == "ENDDATA")
         {
             Info << "Finished reading file." << endl;
             break;
@@ -401,13 +437,6 @@ int main(int argc, char *argv[])
                 << "\", on line " << inFile.lineNumber() << "."
                 << exit(FatalError);
         }
-    }
-
-    Info << "Constructing patches. " << endl;
-    wordList patchNames;
-    forAll(patchIDs, i)
-    {
-        patchNames.append("patch" + std::to_string(i));
     }
 
     DynamicList<faceList> patchFaces;
@@ -456,7 +485,7 @@ int main(int argc, char *argv[])
         {
             cZones[i] = new cellZone
             (
-                "cellZone" + std::to_string(i),
+                cellZoneNames[i],
                 cellZones[i],
                 i,
                 mesh.cellZones()

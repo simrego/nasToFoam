@@ -39,18 +39,26 @@ Description
 #include "polyMesh.H"
 #include "Time.H"
 #include "IFstream.H"
-#include "cellModel.H"
-// #include "cellSet.H"
-// #include "faceSet.H"
-#include "DynamicList.H"
 
 using namespace Foam;
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-string entryBuff;   // Last extracted entry kw
+// Dat file format.
+enum struct FORMAT : label
+{
+    FREE = 0,
+    SMALL = 8,
+    LARGE = 16
+};
+// File format, small by default.
+FORMAT format = FORMAT::SMALL;
+
+// Last extracted entry kw
+string entryBuff;
 // fwd get entry
-string& getEntry(IFstream& is, label size = 8);
+string& getEntry(IFstream& is);
+
 
 bool findBulk(IFstream& is)
 {
@@ -70,14 +78,41 @@ bool findBulk(IFstream& is)
     return false;
 }
 
-string getColumn(IFstream& is, label size = 8)
+// Skip everything on this line, and next lines if we have a multiline.
+void skipLine(IFstream& is)
+{
+    string line;
+    while (true)
+    {
+        is.getLine(line);
+
+        // Remove stupid carriage return char...
+        line.erase(std::remove(line.begin(), line.end(), 13),
+                 line.end());
+
+        // It could be "if (!line.endsWith("+\n")) break;" but it is a little
+        // confusing...
+        if (line.ends_with('+')) continue;
+        else break;
+    }
+
+}
+
+string getColumn(IFstream& is, label size = label(format))
 {
     label i = 0;
     char buff[63];  // More than enough, get size no chars
+
+    if (size == 0) // Increase for free format to avoid overflow
+    {
+        size = 63;
+    }
+
     while (i < size)
     {
         is.get(buff[i]);
-        if (buff[i] == '\n') // newline, stop.
+        // Stop at new line, or ',' for free format.
+        if (buff[i] == '\n' || buff[i] == ',')
         {
             i++;
             break;
@@ -86,28 +121,56 @@ string getColumn(IFstream& is, label size = 8)
     }
     buff[i] = '\0';
 
-    // Continue the line if end with + and next start with +
-    // Probably too much checks...
-    if (buff[0] == '+' && buff[i-1] == '\n' && is.peek() == '+')
+    // Continue on new line if end with + and next start with + or *
+    if (buff[0] == '+' && buff[i-1] == '\n' &&
+        (is.peek() == '+' || is.peek() == '*'))
     {
-        getEntry(is);    // Ignore 1st column
+        if (format == FORMAT::FREE)
+        {
+            char c;
+            while (is.get(c) && c != ',') {}
+        }
+        else is.readRaw(buff, 8);    // Ignore 1st column
+
         // Do it again.
         return getColumn(is, size);
+    }
+
+    // In free format remove ','
+    if (format == FORMAT::FREE)
+    {
+        // Quirky..
+        if (buff[i-1] == ',') buff[i-1] = '\0';
+        if (buff[i-1] == '\n') is.putback('\n');
     }
 
     string data = string(buff);
     // Remove whitespaces
     data.erase(std::remove(data.begin(), data.end(), ' '),
                  data.end());
-    
+
     return data;
 }
 
-string& getEntry(IFstream& is, label size)
+string& getEntry(IFstream& is)
 {
     // Skip comments
     while (is.good() && is.peek() == '$') is.getLine(nullptr);
-    entryBuff = getColumn(is, 8);
+
+    switch (format)
+    {
+    case FORMAT::SMALL:
+    case FORMAT::LARGE:
+        entryBuff = getColumn(is, 8);
+        break;
+    case FORMAT::FREE:
+        entryBuff = getColumn(is, 0);
+        break;
+    }
+
+    if (entryBuff.ends_with('*')) // We have multiline, ignore *.
+        entryBuff.removeEnd('*');
+
     return entryBuff;
 }
 
@@ -158,7 +221,7 @@ void readPoints(IFstream& is, DynamicList<point> &points)
         // Get the 3 coordinate
         points.append(getPoint(is));
         // Ignore the other entries
-        is.getLine(nullptr);
+        skipLine(is); //is.getLine(nullptr);
 
         if (getEntry(is).starts_with("GRID"))
         {
@@ -194,7 +257,7 @@ void readCell
         }
         cellVerts.append(cellShape(model, verts, true));
 
-        is.getLine(nullptr); // Get the end of the line
+        skipLine(is);
         getEntry(is);
     }
 }
@@ -220,7 +283,7 @@ void readFaces
         }
         boundaryFaces.append(fVerts);
 
-        is.getLine(nullptr); // Get the end of the line
+        skipLine(is); // Get the end of the line
         getEntry(is);
     }
 }
@@ -233,14 +296,37 @@ int main(int argc, char *argv[])
     );
     argList::noParallel();
     argList::addArgument(".dat file");
-    // argList::addBoolOption
-    // (
-    //     "dump",
-    //     "Dump boundary faces as boundaryFaces.obj (for debugging)"
-    // );
+    argList::addOption(
+        "format",
+        "word",
+        "Input format. small(default), large, free"
+    );
 
     #include "setRootCase.H"
     #include "createTime.H"
+
+    if (args.found("format"))
+    {
+        word inpForm = args.getOrDefault<word>("format", "small");
+        if (inpForm == "small") 
+        {
+        // Do nothing. Initialised to small.
+        }
+        else if (inpForm == "large")
+        {
+            format = FORMAT::LARGE;
+        }
+        else if (inpForm == "free")
+        {
+            format = FORMAT::FREE;
+        }
+        else
+        {
+            FatalErrorInFunction
+                << "Unknown format: " << inpForm << "."
+                << exit(FatalError);
+        }
+    }
 
     const auto datName = args.get<fileName>(1);
     IFstream inFile(datName);
@@ -310,14 +396,14 @@ int main(int argc, char *argv[])
         {
             // add to cell zones
             cellZoneIDs.append(getLabel(inFile));
-            inFile.getLine(nullptr);
+            skipLine(inFile);
             getEntry(inFile);
         }
         else if (entryBuff == "PSHELL")
         {
             // add to patches
             patchIDs.append(getLabel(inFile));
-            inFile.getLine(nullptr);
+            skipLine(inFile);
             getEntry(inFile);
         }
         else if (entryBuff.starts_with("ENDDATA")) // EOF did some weird stuff.
@@ -328,8 +414,8 @@ int main(int argc, char *argv[])
         else
         {
             FatalErrorInFunction
-                << "Cannot process keyword: " << entryBuff.c_str()
-                << ", on line " << inFile.lineNumber() << "."
+                << "Cannot process keyword: \"" << entryBuff.c_str()
+                << "\", on line " << inFile.lineNumber() << "."
                 << exit(FatalError);
         }
     }

@@ -207,18 +207,24 @@ scalar getScalar(IFstream& is)
 // Read points until we find some different entry.
 // GRID card format, where CP is ignored:
 // GRID   ID   CP   X  Y  Z  ...
-void readPoints(IFstream& is, DynamicList<point> &points)
+void readPoints
+(
+    IFstream& is,
+    DynamicList<point>& points,
+    DynamicList<label>& pointIDs
+)
 {
+    Info<< "\tReading \"GRID\" entries." << endl;
+
     label pointi;
     while (true)
     {
         pointi = getLabel(is);
-        if (pointi != points.size() + 1)
+        if (pointi >= pointIDs.size())
         {
-            FatalErrorInFunction
-                << "Points are not in order."
-                << exit(FatalError);
+            pointIDs.resize(pointi + 1, -1);
         }
+        pointIDs[pointi] = points.size();
 
         // Ignore CP column...
         getColumn(is);
@@ -243,20 +249,28 @@ void readCell
     string name,
     IFstream& is,
     DynamicList<cellShape>& cellVerts,
-    DynamicList<label>& cellPropIDs
+    DynamicList<DynamicList<label>>& cellPropIDs,
+    DynamicList<label>& pointIDs
 )
 {
+    Info<< "\tReading " << name << " entries." << endl;
+    
     const cellModel& model = cellModel::ref(TYPE);
+    label cellPropID;
     while (entryBuff == name)
     {
-        // Ignore cell ID
-        getLabel(is);
-        cellPropIDs.append(getLabel(is));
+        getLabel(is);   // cell ID
+        cellPropID = getLabel(is);
+        if (cellPropID >= cellPropIDs.size())
+        {
+            cellPropIDs.resize(cellPropID + 1);
+        }
+        cellPropIDs[cellPropID].append(cellVerts.size());
+        
         labelList verts(model.nPoints());
         forAll(verts, i)
         {
-            // Vertex indexing starts from 1, but we store from 0.
-            verts[i] = getLabel(is) - 1;
+            verts[i] = pointIDs[getLabel(is)];
         }
         cellVerts.append(cellShape(model, verts, true));
 
@@ -270,21 +284,26 @@ void readFaces
 (
     string name,
     IFstream& is,
-    DynamicList<face>& boundaryFaces,
-    DynamicList<label>& facePropIDs
+    DynamicList<DynamicList<face>>& patches,
+    DynamicList<label>& pointIDs
 )
 {
+    label patchi;
     while (entryBuff == name)
     {
         getLabel(is); // ignore ID
-        facePropIDs.append(getLabel(is));
+        patchi = getLabel(is);
+        if (patchi >= patches.size())
+        {
+            patches.resize(patchi + 1);
+        }
+
         face fVerts(nPoints);
         forAll(fVerts, i)
         {
-            // Vertex indexing starts from 1, but we store from 0.
-            fVerts[i] = getLabel(is) - 1;
+            fVerts[i] = pointIDs[getLabel(is)];
         }
-        boundaryFaces.append(fVerts);
+        patches[patchi].append(fVerts);
 
         finishEntry(is); // Get the end of the line
         getEntry(is);
@@ -350,20 +369,18 @@ int main(int argc, char *argv[])
 
     // Points
     DynamicList<point> points;
+    // Nastran indexing
+    DynamicList<label> pointIDs;
     // Cell vertices
     DynamicList<cellShape> cellVerts;
     // Cell property IDs
-    DynamicList<label> cellPropIDs;
-    // Boundary faces
-    DynamicList<face> boundaryFaces;
-    // Face property IDs
-    DynamicList<label> facePropIDs;
-    // Cell zoneIDs
-    DynamicList<label> cellZoneIDs;
-    wordList cellZoneNames;
+    DynamicList<DynamicList<label>> cellPropIDs;
     // Patch IDs
+    DynamicList<DynamicList<face>> patches;
     DynamicList<label> patchIDs;
-    wordList patchNames;
+    // Porperty card names
+    Map<word> cellZonePropNames;
+    Map<word> patchPropNames;
 
     // Read the next entry into the buffer.
     getEntry(inFile);
@@ -373,59 +390,60 @@ int main(int argc, char *argv[])
     {
         if (entryBuff == "GRID")
         {
-            readPoints(inFile, points);
+            readPoints(inFile, points, pointIDs);
         }
         else if (entryBuff == "CTETRA")
         {
             readCell<cellModel::modelType::TET>(
-                "CTETRA", inFile, cellVerts, cellPropIDs
+                "CTETRA", inFile, cellVerts, cellPropIDs, pointIDs
             );
         }
         else if (entryBuff == "CPYRAM")
         {
             readCell<cellModel::modelType::PYR>(
-                "CPYRAM", inFile, cellVerts, cellPropIDs
+                "CPYRAM", inFile, cellVerts, cellPropIDs, pointIDs
             );
         }
         else if (entryBuff == "CHEXA")
         {
             readCell<cellModel::modelType::HEX>(
-                "CHEXA", inFile, cellVerts, cellPropIDs
+                "CHEXA", inFile, cellVerts, cellPropIDs, pointIDs
             );
         }
         else if (entryBuff == "CTRIA3")
         {
-            readFaces<3>("CTRIA3", inFile, boundaryFaces, facePropIDs);
+            readFaces<3>(
+                "CTRIA3", inFile, patches, pointIDs
+            );
         }
         else if (entryBuff == "PSOLID")
         {
-            // Cell Zones
+            // Cell Zone names
+            label czI = getLabel(inFile);
+
             if (commentLine == inFile.lineNumber())
             {
-                cellZoneNames.append(commentBuffer);
+                cellZonePropNames.insert(czI, commentBuffer);
             }
             else
             {
-                cellZoneNames.append(
-                    "cellZone" + std::to_string(cellZoneNames.size()));
+                cellZonePropNames.insert(czI, "");
             }
-            cellZoneIDs.append(getLabel(inFile));
             finishEntry(inFile);
             getEntry(inFile);
         }
         else if (entryBuff == "PSHELL")
         {
             // Patches
+            label patchI = getLabel(inFile);
             if (commentLine == inFile.lineNumber())
             {
-                patchNames.append(commentBuffer);
+                patchPropNames.insert(patchI, commentBuffer);
             }
             else
             {
-                patchNames.append(
-                    "patch" + std::to_string(patchNames.size()));
+                patchPropNames.insert(patchI, "");
             }
-            patchIDs.append(getLabel(inFile));
             finishEntry(inFile);
             getEntry(inFile);
         }
@@ -444,11 +462,24 @@ int main(int argc, char *argv[])
     }
 
     DynamicList<faceList> patchFaces;
-    patchFaces.resize(patchIDs.size());
-    forAll(boundaryFaces, i)
+    wordList patchNames;
+    label unnamedPatchN = 0;
+    forAll(patchPropNames, i)
     {
-        label pI = patchIDs.find(facePropIDs[i]);
-        patchFaces[pI].append(boundaryFaces[i]);
+        label propI = patchPropNames.toc()[i];
+        word propName = patchPropNames.at(propI);
+        if (patches[propI].size())
+        {
+            patchFaces.append(std::move(patches[propI]));
+            if (propName.empty())
+            {
+                patchNames.append("patch_" + std::to_string(unnamedPatchN++));
+            }
+            else
+            {
+                patchNames.append(propName);
+            }
+        }
     }
 
     Info<< "Constructing the mesh." << endl;
@@ -471,28 +502,27 @@ int main(int argc, char *argv[])
     );
 
     
-    if (cellZoneIDs.size())
+    if (cellPropIDs.size())
     {
         Info<< "Adding cell zones." << endl;
 
-        List<cellZone*> cZones(cellZoneIDs.size());
-        
-        DynamicList<labelList> cellZones;
-        cellZones.resize(cellZoneIDs.size());
-        forAll(cellPropIDs, i)
+        List<cellZone*> cZones;
+        label unnamedCellZoneN = 0;
+        forAll(cellZonePropNames, i)
         {
-            label zI = cellZoneIDs.find(cellPropIDs[i]);
-            cellZones[zI].append(i);
-        }
-        
-        forAll(cellZoneIDs, i)
-        {
-            cZones[i] = new cellZone
+            label propI = cellZonePropNames.toc()[i];
+            word propName = cellZonePropNames.at(propI);
+            if (propName.empty())
+                propName = "cellZone_" + std::to_string(unnamedCellZoneN++);
+            cZones.append
             (
-                cellZoneNames[i],
-                cellZones[i],
-                i,
-                mesh.cellZones()
+                new cellZone
+                (
+                    propName,
+                    cellPropIDs[propI],
+                    i,
+                    mesh.cellZones()
+                )
             );
         }
 
@@ -504,8 +534,16 @@ int main(int argc, char *argv[])
         << "Number of points: " << mesh.nPoints() << endl
         << "Number of faces: " << mesh.nFaces() << endl
         << "Number of cells: " << mesh.nCells() << endl
-        << "Number of patches: " << patchNames.size() << ":" << endl;
+        << "Found patch names:" << endl;
     forAll(patchNames, i) Info<< "\t" << patchNames[i] << endl;
+    if (mesh.cellZones().size())
+    {
+        Info<< "Found cell zones:" << endl;
+        forAll(mesh.cellZones(), i)
+        {
+            Info<< "\t" << mesh.cellZones()[i].name() << endl;
+        }
+    }
     Info<< endl;
 
     mesh.removeFiles();

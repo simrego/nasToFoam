@@ -189,13 +189,17 @@ label getLabel(IFstream& is)
 }
 
 // Scientific notation sucks in nastran...
+// Sometimes we have E, sometimes we don't... ?!?!
 scalar getScalar(IFstream& is)
 {
     string data = getColumn(is);
     // This is stupid. And probably costly.
     label id = data.find('+', 1); // contains e+
     if (id == -1) id = data.find('-', 1); // contains e-
-    if (id != -1) data = data.substr(0, id) + "e" + data.substr(id);
+    if (id != -1 && (data[id-1] != 'e' && data[id-1] != 'E'))
+    {
+        data = data.substr(0, id) + "e" + data.substr(id);
+    }
 
     return readFloat(data);
 }

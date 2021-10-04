@@ -31,14 +31,15 @@ using namespace Foam;
 // Dat file format.
 enum struct FORMAT : char
 {
-    FREE = 0,
-    SMALL = 8,
-    LARGE = 16
+    FREE = 0,       // Free format, column delimiter: ','
+    SMALL = 8,      // Small format, every column 8 char wide
+    LARGE = 16      // Large format, forst column 8, others 16 char wide.
 };
 // File format, small by default.
 FORMAT format = FORMAT::SMALL;
 
 // Last extracted entry kw
+// Always read the next one if we are done with a line/multiline
 string entryBuff;
 
 // Buffer for last comment with it's line number. (patch, cellZone names)
@@ -46,6 +47,7 @@ word commentBuffer;
 label commentLine;
 
 // Get the next entry and store it in the buffer (fwd)
+// Also return a reference to it.
 string& getEntry(IFstream& is);
 
 // Ignore everything until we find the "BEGIN BULK" entry
@@ -79,7 +81,8 @@ void processCommentedLine(IFstream& is)
 // Skip everything on this line, and next lines if we have a multiline entry.
 // The only problem if we get the '\n' from the stream. In this case the
 // next line will be skipped which shouldn't be...
-// WARNING: Make sure the '\n' is kept in the stream.
+// WARNING: Make sure the '\n' is kept in the stream. Only happens with 
+// free format.
 void finishEntry(IFstream& is)
 {
     string line;
@@ -105,10 +108,11 @@ string getColumn(IFstream& is, char size = char(format))
         size = 63;
     }
  
-    label i = 0;
-    char buff[63];  // More than enough, get size no chars
+    char buff[63];  // More than enough.
 
-    while (i < size)
+    label i = 0;
+    label nRead = 0;
+    while (nRead++ < size && i < size)
     {
         is.get(buff[i]);
         // Stop at new line, or ',' for free format.
@@ -119,51 +123,56 @@ string getColumn(IFstream& is, char size = char(format))
         }
         else if (buff[i] == ',') // only possible in free format
         {
-            // DOnt increase i, so we will change it to '\0'
+            // Dont increase i, so we will simply change it to '\0'
             break;
+        }
+        else if (isspace(buff[i]) || buff[i] == 13)
+        {
+            // space or carriage return char (happens sometimes ?!?!?!)
+            // Just continue without increasing i
+            continue;
         }
         i++;
     }
+    // Close the string.
     buff[i] = '\0';
 
     // Continue on new line if end with "+\n" and next start with + or *
     if (buff[0] == '+' && buff[i-1] == '\n' &&
         (is.peek() == '+' || is.peek() == '*'))
     {
+        // Multiline, ignore the 1st column
         if (format == FORMAT::FREE)
         {
             char c;
             while (is.get(c) && c != ',') {}
         }
-        else is.readRaw(buff, 8);    // Ignore 1st column
+        else
+        {
+            is.readRaw(buff, 8);
+        }
 
-        // Do it again.
+        // We are in the next line, start again.
         return getColumn(is, size);
     }
 
     // In free format '\n' is removed from the stream but we will need it
-    // to finish the entry. Put it back IF we have it.
+    // to properly finish the entry.
+    // Put it back if we have it and close the string.
     if (format == FORMAT::FREE && buff[i-1] == '\n')
     {
         buff[i-1] = '\0';
         is.putback('\n');
     }
 
-    string data = string(buff);
-    // Remove whitespaces
-    data.erase(std::remove(data.begin(), data.end(), ' '),
-                 data.end());
-
-    // Remove stupid carriage return char...
-    data.erase(std::remove(data.begin(), data.end(), 13),
-             data.end());
-
-    return data;
+    return string(buff);
 }
 
 string& getEntry(IFstream& is)
 {
-    // Skip comments
+    // Finish the current line/multiline
+    finishEntry(is);
+    // Process comments
     while (is.good() && is.peek() == '$') processCommentedLine(is);
 
     switch (format)
@@ -183,11 +192,13 @@ string& getEntry(IFstream& is)
     return entryBuff;
 }
 
+// Read the next column and return as label
 label getLabel(IFstream& is)
 {
     return readLabel(getColumn(is));
 }
 
+// Read the next column and return as scalar
 // Scientific notation sucks in nastran...
 // Sometimes we have E, sometimes we don't... ?!?!
 scalar getScalar(IFstream& is)
@@ -217,7 +228,7 @@ void readPoints
     Info<< "\tReading \"GRID\" entries." << endl;
 
     label pointi;
-    while (true)
+    do
     {
         pointi = getLabel(is);
         if (pointi >= pointIDs.size())
@@ -234,22 +245,18 @@ void readPoints
         pt[1] = getScalar(is);
         pt[2] = getScalar(is);
         points.append(pt);
-        // Ignore the other entries
-        finishEntry(is); //is.getLine(nullptr);
 
-        // No more GRID entry.
-        if (!getEntry(is).starts_with("GRID")) break;
-    }
+    } while (getEntry(is) == "GRID");
 }
 
-// Read cells of a given type.
+// Read cells of a given type until we find a different keyword.
 template<cellModel::modelType TYPE>
 void readCell
 (
     string name,
     IFstream& is,
-    DynamicList<cellShape>& cellVerts,
-    DynamicList<DynamicList<label>>& cellPropIDs,
+    DynamicList<cellShape>& cells,
+    Map<DynamicList<label>>& cellPropIDs,
     DynamicList<label>& pointIDs
 )
 {
@@ -257,45 +264,44 @@ void readCell
     
     const cellModel& model = cellModel::ref(TYPE);
     label cellPropID;
-    while (entryBuff == name)
+    do
     {
-        getLabel(is);   // cell ID
+        getColumn(is);   // ignore cell ID
         cellPropID = getLabel(is);
-        if (cellPropID >= cellPropIDs.size())
+        if (!cellPropIDs.found(cellPropID))
         {
-            cellPropIDs.resize(cellPropID + 1);
+            cellPropIDs.insert(cellPropID, DynamicList<label>());
         }
-        cellPropIDs[cellPropID].append(cellVerts.size());
+        cellPropIDs.at(cellPropID).append(cells.size());
         
         labelList verts(model.nPoints());
         forAll(verts, i)
         {
             verts[i] = pointIDs[getLabel(is)];
         }
-        cellVerts.append(cellShape(model, verts, true));
+        cells.append(cellShape(model, verts, true));
 
-        finishEntry(is);
-        getEntry(is);
-    }
+    } while (getEntry(is) == name);
 }
 
+// Read faces until we find a different kieyword
 template<label nPoints>
 void readFaces
 (
     string name,
     IFstream& is,
-    DynamicList<DynamicList<face>>& patches,
+    Map<DynamicList<face>>& patches,
     DynamicList<label>& pointIDs
 )
 {
-    label patchi;
-    while (entryBuff == name)
+    label patchI;
+    do
     {
-        getLabel(is); // ignore ID
-        patchi = getLabel(is);
-        if (patchi >= patches.size())
+        getColumn(is); // ignore ID
+        patchI = getLabel(is);
+        if (!patches.found(patchI))
         {
-            patches.resize(patchi + 1);
+            patches.insert(patchI, DynamicList<face>());
         }
 
         face fVerts(nPoints);
@@ -303,18 +309,16 @@ void readFaces
         {
             fVerts[i] = pointIDs[getLabel(is)];
         }
-        patches[patchi].append(fVerts);
+        patches.at(patchI).append(fVerts);
 
-        finishEntry(is); // Get the end of the line
-        getEntry(is);
-    }
+    } while (getEntry(is) == name);
 }
 
 int main(int argc, char *argv[])
 {
     argList::addNote
     (
-        "Convert nastran dat file to OpenFOAM. Only for small format and Meters."
+        "Convert nastran dat file to OpenFOAM. Units assumed to be in meters."
     );
     argList::noParallel();
     argList::addArgument(".dat file");
@@ -325,7 +329,7 @@ int main(int argc, char *argv[])
     );
     argList::addBoolOption(
         "defaultNames",
-        "Use default patch and cellZone names."
+        "Use default patch and cellZone names, don't use the comments."
     );
 
     #include "setRootCase.H"
@@ -374,18 +378,20 @@ int main(int argc, char *argv[])
 
     // Points
     DynamicList<point> points;
-    // Nastran indexing
+    // Nastran indexing. pointIDs[nastranIndex] = <points index>
+    // Could contain a lot of -1 elements, but the renumbering is
+    // really fast in a cost of a little extra memory..
     DynamicList<label> pointIDs;
-    // Cell vertices
-    DynamicList<cellShape> cellVerts;
+    // Cells
+    DynamicList<cellShape> cells;
     // Cell property IDs
-    DynamicList<DynamicList<label>> cellPropIDs;
-    // Patch IDs
-    DynamicList<DynamicList<face>> patches;
-    DynamicList<label> patchIDs;
+    // key is the nastran porperty ID
+    Map<DynamicList<label>> cellPropIDs;
+    // Patches
+    // key is the nastran porperty ID
+    Map<DynamicList<face>> patches;
     // Porperty card names
-    Map<word> cellZonePropNames;
-    Map<word> patchPropNames;
+    Map<word> propNames;
 
     // Read the next entry into the buffer.
     getEntry(inFile);
@@ -400,19 +406,19 @@ int main(int argc, char *argv[])
         else if (entryBuff == "CTETRA")
         {
             readCell<cellModel::modelType::TET>(
-                "CTETRA", inFile, cellVerts, cellPropIDs, pointIDs
+                "CTETRA", inFile, cells, cellPropIDs, pointIDs
             );
         }
         else if (entryBuff == "CPYRAM")
         {
             readCell<cellModel::modelType::PYR>(
-                "CPYRAM", inFile, cellVerts, cellPropIDs, pointIDs
+                "CPYRAM", inFile, cells, cellPropIDs, pointIDs
             );
         }
         else if (entryBuff == "CHEXA")
         {
             readCell<cellModel::modelType::HEX>(
-                "CHEXA", inFile, cellVerts, cellPropIDs, pointIDs
+                "CHEXA", inFile, cells, cellPropIDs, pointIDs
             );
         }
         else if (entryBuff == "CTRIA3")
@@ -421,34 +427,25 @@ int main(int argc, char *argv[])
                 "CTRIA3", inFile, patches, pointIDs
             );
         }
-        else if (entryBuff == "PSOLID")
+        else if (entryBuff == "PSOLID" || entryBuff == "PSHELL")
         {
-            // Cell Zones
-            label czI = getLabel(inFile);
+            // Property names
+            label propI = getLabel(inFile);
+            if (propNames.found(propI))
+            {
+                FatalErrorInFunction
+                    << "Property ID: " << propI << " is already defined."
+                    << exit(FatalError);
+            }
+
             if (commentLine == inFile.lineNumber() && !defaultNames)
             {
-                cellZonePropNames.insert(czI, commentBuffer);
+                propNames.insert(propI, commentBuffer);
             }
             else
             {
-                cellZonePropNames.insert(czI, "");
+                propNames.insert(propI, "");
             }
-            finishEntry(inFile);
-            getEntry(inFile);
-        }
-        else if (entryBuff == "PSHELL")
-        {
-            // Patches
-            label patchI = getLabel(inFile);
-            if (commentLine == inFile.lineNumber() && !defaultNames)
-            {
-                patchPropNames.insert(patchI, commentBuffer);
-            }
-            else
-            {
-                patchPropNames.insert(patchI, "");
-            }
-            finishEntry(inFile);
             getEntry(inFile);
         }
         else if (entryBuff == "ENDDATA")
@@ -468,10 +465,10 @@ int main(int argc, char *argv[])
     DynamicList<faceList> patchFaces;
     wordList patchNames;
     label unnamedPatchN = 0;
-    forAll(patchPropNames, i)
+    forAll(patches, i)
     {
-        label propI = patchPropNames.toc()[i];
-        word propName = patchPropNames.at(propI);
+        label propI = patches.toc()[i];
+        word propName = propNames.at(propI);
         if (patches[propI].size())
         {
             patchFaces.append(std::move(patches[propI]));
@@ -496,7 +493,7 @@ int main(int argc, char *argv[])
             runTime
         ),
         pointField(points),
-        cellVerts,
+        cells,
         patchFaces,
         patchNames,
         wordList(patchNames.size(), polyPatch::typeName),
@@ -512,10 +509,10 @@ int main(int argc, char *argv[])
 
         List<cellZone*> cZones;
         label unnamedCellZoneN = 0;
-        forAll(cellZonePropNames, i)
+        forAll(cellPropIDs, i)
         {
-            label propI = cellZonePropNames.toc()[i];
-            word propName = cellZonePropNames.at(propI);
+            label propI = cellPropIDs.toc()[i];
+            word propName = propNames.at(propI);
             if (propName.empty())
                 propName = "cellZone_" + std::to_string(unnamedCellZoneN++);
             cZones.append
@@ -538,11 +535,14 @@ int main(int argc, char *argv[])
         << "Number of points: " << mesh.nPoints() << endl
         << "Number of faces: " << mesh.nFaces() << endl
         << "Number of cells: " << mesh.nCells() << endl
-        << "Found patch names:" << endl;
-    forAll(patchNames, i) Info<< "\t" << patchNames[i] << endl;
+        << "Patch names:" << endl;
+    forAll(mesh.boundaryMesh(), i)
+    {
+        Info<< "\t" << mesh.boundaryMesh().get(i)->name() << endl;
+    }
     if (mesh.cellZones().size())
     {
-        Info<< "Found cell zones:" << endl;
+        Info<< "Cell zones:" << endl;
         forAll(mesh.cellZones(), i)
         {
             Info<< "\t" << mesh.cellZones()[i].name() << endl;

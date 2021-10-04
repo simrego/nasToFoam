@@ -323,6 +323,10 @@ int main(int argc, char *argv[])
         "word",
         "Input format. Options: small(default), large, free"
     );
+    argList::addBoolOption(
+        "defaultNames",
+        "Use default patch and cellZone names."
+    );
 
     #include "setRootCase.H"
     #include "createTime.H"
@@ -349,6 +353,7 @@ int main(int argc, char *argv[])
                 << exit(FatalError);
         }
     }
+    bool defaultNames = args.found("defaultNames");
 
     const auto datName = args.get<fileName>(1);
     IFstream inFile(datName);
@@ -418,10 +423,9 @@ int main(int argc, char *argv[])
         }
         else if (entryBuff == "PSOLID")
         {
-            // Cell Zone names
+            // Cell Zones
             label czI = getLabel(inFile);
-
-            if (commentLine == inFile.lineNumber())
+            if (commentLine == inFile.lineNumber() && !defaultNames)
             {
                 cellZonePropNames.insert(czI, commentBuffer);
             }
@@ -436,7 +440,7 @@ int main(int argc, char *argv[])
         {
             // Patches
             label patchI = getLabel(inFile);
-            if (commentLine == inFile.lineNumber())
+            if (commentLine == inFile.lineNumber() && !defaultNames)
             {
                 patchPropNames.insert(patchI, commentBuffer);
             }
@@ -548,6 +552,8 @@ int main(int argc, char *argv[])
 
     mesh.removeFiles();
     mesh.write();
+
+    runTime.printExecutionTime(Info);
 
     Info<< "End\n" << endl;
 

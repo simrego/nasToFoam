@@ -427,6 +427,10 @@ int main(int argc, char *argv[])
                 "CTRIA3", inFile, patches, pointIDs
             );
         }
+        else if (entryBuff == "CQUAD4")
+        {
+            readFaces<4>("CQUAD4", inFile, patches, pointIDs);
+        }
         else if (entryBuff == "PSOLID" || entryBuff == "PSHELL")
         {
             // Property names
